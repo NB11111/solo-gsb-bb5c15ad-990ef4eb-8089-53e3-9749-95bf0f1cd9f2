@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: sample-pooling-api:latest
+    container_name: sample-pooling-api
+    ports:
+      - "8000:8000"
+    environment:
+      POOLING_DB_PATH: /data/pooling.db
+    volumes:
+      - pooling-data:/data
+    restart: unless-stopped
+
+volumes:
+  pooling-data:
