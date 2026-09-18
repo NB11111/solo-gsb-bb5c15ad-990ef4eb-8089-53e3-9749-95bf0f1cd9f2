@@ -275,3 +275,70 @@ def test_non_positive_delivered_amount_rejected(client):
     assert response.status_code == 422
     locs = [".".join(str(x) for x in e["loc"]) for e in response.json()["detail"]]
     assert any(loc.endswith("delivered_amount") for loc in locs)
+
+
+def test_execution_mode_defaults_to_sequential(client):
+    response = client.post("/api/simulations", json=VALID_PAYLOAD)
+    assert response.status_code == 201
+    body = response.json()
+    assert body["execution_mode"] == "sequential"
+    assert [s["batch_index"] for s in body["steps"]] == [0]
+
+
+def test_time_batch_mode_atomic_and_persisted(client):
+    # 同刻双向转移：sequential 下顺序会影响结果，time_batch 下基于批次快照
+    payload = {
+        "execution_mode": "time_batch",
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 50.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 60.0, "delivered_amount": 55.0},
+            {"time": 1, "source": "B", "target": "A", "amount": 50.0, "delivered_amount": 45.0},
+        ],
+    }
+    created = client.post("/api/simulations", json=payload)
+    assert created.status_code == 201
+    body = created.json()
+    assert body["execution_mode"] == "time_batch"
+    assert [s["batch_index"] for s in body["steps"]] == [0, 0]
+    assert body["conservation"]["volume_difference"] == 0
+    assert body["waste"]["volume"] == 10.0
+
+    # 模式与 batch_index 随结果一起持久化
+    fetched = client.get(f"/api/simulations/{body['id']}")
+    assert fetched.status_code == 200
+    saved = fetched.json()
+    assert saved["execution_mode"] == "time_batch"
+    assert [s["batch_index"] for s in saved["steps"]] == [0, 0]
+
+
+def test_time_batch_invalid_execution_mode_rejected(client):
+    payload = dict(VALID_PAYLOAD, execution_mode="parallel")
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    locs = [".".join(str(x) for x in e["loc"]) for e in response.json()["detail"]]
+    assert any("execution_mode" in loc for loc in locs)
+
+
+def test_time_batch_overdraw_whole_batch_aborted(client):
+    payload = {
+        "execution_mode": "time_batch",
+        "samples": [
+            {"id": "A", "initial_volume": 100.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 50.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 70.0},
+            {"time": 1, "source": "A", "target": "B", "amount": 50.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 400
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error"]["code"] == "INSUFFICIENT_VOLUME"
+    assert body["error"]["transfer_index"] == 0
+    assert body["steps"] == []
+    assert body["waste"]["volume"] == 0.0

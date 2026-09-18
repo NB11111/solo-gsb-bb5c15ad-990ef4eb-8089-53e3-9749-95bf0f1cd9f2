@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional, Union
 
 from pydantic import (
@@ -24,6 +25,19 @@ from pydantic import (
 
 # 数值时间 / ISO 8601 时间均可
 TimeValue = Union[int, float, str]
+
+
+class ExecutionMode(str, Enum):
+    """同时间转移的执行方式。
+
+    * ``sequential``（默认）：按数组顺序逐条即时落地，保持旧版行为；
+    * ``time_batch``：解析后 time 相等的连续转移合并为一个原子批次——
+      所有吸取量都基于批次开始时的快照按源管汇总校验，目标管写入与
+      waste 累计在全部校验通过后统一完成，同批内不依赖数组顺序。
+    """
+
+    SEQUENTIAL = "sequential"
+    TIME_BATCH = "time_batch"
 
 
 def parse_time(value: TimeValue) -> float:
@@ -185,6 +199,14 @@ class SimulationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: Optional[str] = Field(default=None, max_length=256, description="本次模拟的名称")
+    execution_mode: ExecutionMode = Field(
+        default=ExecutionMode.SEQUENTIAL,
+        description=(
+            "同时间转移的执行方式：sequential（默认，按数组顺序逐条执行，"
+            "兼容旧版行为）或 time_batch（同 time 的连续转移作为原子批次："
+            "基于批次开始快照按源管汇总校验后统一写入）"
+        ),
+    )
     samples: list[SampleIn] = Field(..., min_length=1, description="初始样本管列表")
     transfers: list[TransferIn] = Field(default_factory=list, description="按时间排序的转移操作")
 
@@ -253,6 +275,13 @@ class ConservationOut(BaseModel):
 
 class StepOut(BaseModel):
     index: int
+    batch_index: int = Field(
+        ...,
+        description=(
+            "所属执行批次序号（从 0 起）：sequential 模式下每步自成一批；"
+            "time_batch 模式下解析后 time 相等的连续转移共享同一 batch_index"
+        ),
+    )
     transfer_id: Optional[str]
     time: TimeValue
     source: str
@@ -288,6 +317,7 @@ class SimulationResult(BaseModel):
     id: str
     status: str
     name: Optional[str] = None
+    execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL
     created_at: str
     initial_states: list[TubeStateOut]
     steps: list[StepOut]

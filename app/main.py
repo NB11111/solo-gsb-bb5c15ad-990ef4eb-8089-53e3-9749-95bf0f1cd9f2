@@ -27,9 +27,13 @@ app = FastAPI(
         "提交初始样本（体积 + 标记物浓度）和按时间排序的转移操作，"
         "服务逐步计算混合浓度与来源占比，并对含移液损耗（可选 "
         "delivered_amount）的系统按“所有管内 + 累计 waste”口径做守恒校验，"
-        "每次模拟记录持久化到 SQLite。"
+        "每次模拟记录持久化到 SQLite。\n\n"
+        "execution_mode=sequential（默认）按数组顺序逐条执行；"
+        "execution_mode=time_batch 将解析后 time 相等的连续转移作为原子批次："
+        "所有吸取基于批次开始快照按源管汇总校验，再统一写入目标管与 waste，"
+        "同批操作不受数组顺序影响，每步结果带 batch_index。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
