@@ -275,3 +275,87 @@ def test_non_positive_delivered_amount_rejected(client):
     assert response.status_code == 422
     locs = [".".join(str(x) for x in e["loc"]) for e in response.json()["detail"]]
     assert any(loc.endswith("delivered_amount") for loc in locs)
+
+
+def test_execution_mode_defaults_to_sequential(client):
+    response = client.post("/api/simulations", json=VALID_PAYLOAD)
+    assert response.status_code == 201
+    step = response.json()["steps"][0]
+    assert step["batch_index"] == step["index"] == 0
+
+
+def test_time_batch_mode_atomic_batch_api(client):
+    # 同一时刻 A<->B 双向转移：吸取基于批次开始快照，与数组顺序无关；
+    # 单条不超量、合计超量时整批失败
+    payload = {
+        "execution_mode": "time_batch",
+        "samples": [
+            {"id": "A", "initial_volume": 10.0, "concentration": 10.0},
+            {"id": "B", "initial_volume": 10.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 6.0},
+            {"time": 1, "source": "B", "target": "A", "amount": 6.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 201
+    body = response.json()
+    assert [step["batch_index"] for step in body["steps"]] == [0, 0]
+
+    final = {t["id"]: t for t in body["final_states"]}
+    assert final["A"]["volume"] == 10.0
+    assert final["B"]["volume"] == 10.0
+    assert final["A"]["concentrations"]["default"] == 4.0
+    assert body["conservation"]["volume_difference"] == 0
+
+    # 结果持久化后仍可复查到 batch_index
+    fetched = client.get(f"/api/simulations/{body['id']}")
+    assert fetched.status_code == 200
+    assert [step["batch_index"] for step in fetched.json()["steps"]] == [0, 0]
+
+
+def test_time_batch_aggregate_overdraw_returns_400(client):
+    payload = {
+        "execution_mode": "time_batch",
+        "samples": [
+            {"id": "A", "initial_volume": 10.0, "concentration": 1.0},
+            {"id": "B", "initial_volume": 10.0, "concentration": 0.0},
+        ],
+        "transfers": [
+            {"time": 1, "source": "A", "target": "B", "amount": 6.0},
+            {"time": 1, "source": "A", "target": "B", "amount": 6.0},
+        ],
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 400
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error"]["code"] == "INSUFFICIENT_VOLUME"
+    assert body["error"]["transfer_index"] == 1
+    assert body["error"]["location"] == "transfers[1].amount"
+    # 整批未落地
+    assert body["steps"] == []
+    assert body["waste"]["volume"] == 0
+
+
+def test_invalid_execution_mode_rejected_422(client):
+    payload = {
+        **VALID_PAYLOAD,
+        "execution_mode": "parallel",
+    }
+    response = client.post("/api/simulations", json=payload)
+    assert response.status_code == 422
+    locs = [".".join(str(x) for x in e["loc"]) for e in response.json()["detail"]]
+    assert any(loc.endswith("execution_mode") for loc in locs)
+
+
+def test_openapi_documents_execution_mode_and_batch_index(client):
+    schema = client.get("/openapi.json").json()
+    request_props = schema["components"]["schemas"]["SimulationRequest"]["properties"]
+    assert request_props["execution_mode"]["default"] == "sequential"
+    assert {"sequential", "time_batch"} == set(
+        request_props["execution_mode"]["enum"]
+    )
+    step_props = schema["components"]["schemas"]["StepOut"]["properties"]
+    assert "batch_index" in step_props

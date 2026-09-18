@@ -9,6 +9,9 @@
 * 可选 `delivered_amount` 时的**移液损耗追踪**：吸出量 `amount` 与实际
   入管量 `delivered_amount` 的差额按源管当时浓度、来源比例计入该步 `lost`，
   并累计为结果 `waste`；
+* 两种执行模式：默认 `sequential`（逐条顺序执行）；`time_batch` 把同一时刻
+  的连续转移视为**一批原子操作**——吸取全部基于批次开始快照、先按源管汇总
+  校验可用量、再统一写入，同批结果与数组顺序无关；
 * 两个口径的守恒量：含 waste 的**系统总量差**（应恒为 0）与仅看管内的
   **管内体积 / 质量变化**（恰好等于累计损耗）。
 
@@ -44,6 +47,18 @@ docker compose down          # 保留数据
 docker compose down -v       # 同时清空数据库卷
 ```
 
+更新代码后重新构建并启动（镜像名 `sample-pooling-api:latest`，无需外部
+镜像仓库）：
+
+```bash
+docker compose up --build
+```
+
+如需确认容器内运行的新版本，可查看自动生成的 OpenAPI 文档：
+`http://localhost:8000/openapi.json`（其中 `info.version` 随服务版本更新，
+`SimulationRequest.execution_mode` 与 `StepOut.batch_index` 均已包含在
+schema 中），交互式文档在 `/docs`、`/redoc`。
+
 ### 启动后的示例（含移液损耗追踪）
 
 服务起来后，另开一个终端执行（第一步吸 50 只注入 48，损耗 2）：
@@ -76,6 +91,37 @@ curl -s "http://localhost:8000/api/simulations?limit=10" | python3 -m json.tool
 `conservation.final_total_volume == 150.0`（含 waste）、
 `volume_difference == 0` 且 `tube_volume_change == -2.0`；
 第二步未传 `delivered_amount`，`lost.volume == 0`，行为与旧版一致。
+
+### 启动后的示例（time_batch 原子批次）
+
+`execution_mode` 不传时默认 `sequential`，行为与旧版完全一致。设为
+`time_batch` 后，解析后 `time` 相等的连续转移合成一批：所有吸取都基于批次
+开始时的源管快照计算，因此同一时刻的双向转移与数组顺序无关；只有先按源管
+汇总 `amount` 校验全部可用后，才统一写入目标管与 waste。
+
+```bash
+curl -s -X POST http://localhost:8000/api/simulations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "同时刻双向转移-原子批次",
+    "execution_mode": "time_batch",
+    "samples": [
+      {"id": "S1", "initial_volume": 10, "concentration": 10},
+      {"id": "S2", "initial_volume": 10, "concentration": 0}
+    ],
+    "transfers": [
+      {"time": 1, "source": "S1", "target": "S2", "amount": 6},
+      {"time": 1, "source": "S2", "target": "S1", "amount": 6}
+    ]
+  }' | python3 -m json.tool
+```
+
+预期要点：两个步骤的 `batch_index` 都为 `0`；每步的 `source_after` /
+`target_after` / `conservation` 均为整批执行后的视图。批次内一吸一收后
+两管体积都仍是 10，S1 浓度变为 4.0（剩余质量 40 / 体积 10），S2 变为 6.0；
+交换两条 transfers 的顺序结果完全相同。若把两条 `S1 -> S2` 的吸取量写成
+各 6（合计 12 > 10），返回 400，`error.transfer_index` 定位到
+`transfers[1]`，整批不落地、`steps` 为空；之前批次（更小 time）的结果保留。
 
 ---
 
@@ -131,6 +177,22 @@ pytest -q
    各自之和恒为 1（空集合除外）。
 7. **浮点处理**：小于 `1e-12` 的残余量按 0 清理，结果保留 12 位小数。
 8. **时间规则**：转移必须按时间**非递减**（允许同一时刻多次操作）。
+9. **执行模式 `execution_mode`**：
+   * `sequential`（默认）：逐条顺序执行，每条转移自成一批
+     （`batch_index == index`），与旧版行为完全一致；
+   * `time_batch`：解析后 `time` 相等的连续转移合成**一批原子操作**。
+     * 批次内所有吸取都基于**批次开始快照**计算浓度与来源构成，同批
+       计算结果与数组顺序无关（同一支管同时收、发也互不影响）；
+     * 先按源管汇总本批 `amount` 与批次开始可用量比较，任一源管累计
+       超量则**整批不落地**，错误定位到原 `transfers` 下标（首个导致
+       累计超量的操作，`location` 形如 `transfers[i].amount`）；
+     * 校验通过后再把全部源管减量、目标管增量与 waste 增量**统一写入**；
+     * 同批各步的 `source_after` / `target_after` / `conservation`
+       都是整批执行后的视图，`batch_index` 相同；守恒以批次为单位，
+       覆盖多源、多目标、同管收发及 `delivered_amount` 损耗；
+     * 某批失败时仅该批不落地，之前批次已提交的步骤与状态保留
+       （`TIME_NOT_ORDERED` / `UNKNOWN_SAMPLE` / `SAME_SOURCE_TARGET`
+       同理，下标均指向原 transfers 序列）。
 
 标记物支持两种写法，可混用：
 
@@ -155,6 +217,7 @@ curl -s -X POST http://localhost:8000/api/simulations \
   -H "Content-Type: application/json" \
   -d '{
     "name": "含移液损耗的两管互混",
+    "execution_mode": "sequential",
     "samples": [
       {"id": "S1", "initial_volume": 100, "concentration": 12.5},
       {"id": "S2", "initial_volume": 50,  "markers": {"RFP": 8}}
@@ -164,6 +227,28 @@ curl -s -X POST http://localhost:8000/api/simulations \
       {"time": "2026-09-18T10:30:00Z", "source": "S2", "target": "S1", "amount": 25}
     ]
   }'
+```
+
+顶层可选字段 `execution_mode`：
+
+| 取值 | 语义 |
+| --- | --- |
+| `sequential`（默认，缺省即此值） | 按数组顺序逐条执行，每条转移一个批次（`batch_index == index`） |
+| `time_batch` | 解析后 `time` 相等的连续转移合为一批原子执行：吸取基于批次开始快照、按源管汇总 `amount` 校验后统一写入；同批每步都带相同 `batch_index` |
+
+time_batch 下若同批对同一源管的合计吸取量超过其批次开始体积（即使每条
+单独看不超量），整批返回 400 且不落地：
+
+```json
+{
+  "status": "failed",
+  "error": {
+    "code": "INSUFFICIENT_VOLUME",
+    "message": "transfers[1] 使批次（batch 起始于 transfers[0]，共 2 个同时刻操作）从 'A' 的累计吸取量达到 12.0，但该管批次开始时仅有 10.0",
+    "transfer_index": 1,
+    "location": "transfers[1].amount"
+  }
+}
 ```
 
 第一步从 S1 吸出 `50` 但实际注入 S2 `48`，`2` 的差额按 S1 当时浓度
@@ -184,6 +269,7 @@ curl -s -X POST http://localhost:8000/api/simulations \
   "steps": [
     {
       "index": 0,
+      "batch_index": 0,            // 所属批次；time_batch 下同批多步共享
       "time": "2026-09-18T09:00:00Z",
       "source": "S1", "target": "S2",
       "amount": 50.0,              // 从源管吸出的体积
@@ -202,7 +288,8 @@ curl -s -X POST http://localhost:8000/api/simulations \
       "source_after": { /* 按吸出量 50 扣减：S1 剩 50 */ },
       "target_after": { /* 按入管量 48 增加：S2 变为 98 */ },
       "conservation": {
-        // before/after 为“所有管内 + 截至本步累计 waste”的系统口径
+        // before/after 为“所有管内 + 截至本步累计 waste”的系统口径；
+        // time_batch 下以整批为单位，同批各步的该字段相同
         "volume_before": 150.0, "volume_after": 150.0,
         "volume_difference": 0.0,            // 系统总量差：恒为 0
         "tube_volume_change": -2.0,          // 仅看管内的体积变化
@@ -238,6 +325,12 @@ curl -s -X POST http://localhost:8000/api/simulations \
 `lost.volume` 为 `0`、`origins` 为空，顶层 `waste` 同样为零，
 `tube_*_change` 与系统差值均为 `0`，原有字段语义不变。
 
+不传 `execution_mode`（或显式传 `sequential`）时，每个 `index` 自成一批、
+`batch_index == index`，逐步的 `source_after` / `target_after` /
+`conservation` 仍为该步执行后的视图，与旧版逐条顺序执行的结果逐字段一致。
+`time_batch` 下，同批每步的这三项均为**整批执行后**的统一视图，而
+`transferred` / `lost` / `amount` / `delivered_amount` 仍只描述该操作本身。
+
 ### 错误响应（定位明确）
 
 业务错误返回 `400`，响应体其余字段（已完成步骤、当时各管状态）仍可用于排查；
@@ -260,14 +353,15 @@ curl -s -X POST http://localhost:8000/api/simulations \
 
 | code | 触发条件 | location 示例 |
 | --- | --- | --- |
-| `INSUFFICIENT_VOLUME` | 转移量超过源管当前体积 | `transfers[i].amount` |
-| `TIME_NOT_ORDERED` | 转移时间早于上一次转移 | `transfers[i].time` |
+| `INSUFFICIENT_VOLUME` | 转移量超过源管可用体积（time_batch 下为批次内按源管汇总的累计吸取量超过批次开始体积，定位到首个超量操作） | `transfers[i].amount` |
+| `TIME_NOT_ORDERED` | 转移时间早于上一批转移 | `transfers[i].time` |
 | `UNKNOWN_SAMPLE` | 源 / 目标管未在 `samples` 中声明 | `transfers[i].source` / `.target` |
 | `SAME_SOURCE_TARGET` | 源管与目标管相同 | `transfers[i]` |
 | `SIMULATION_NOT_FOUND` | 查询不存在的记录 id | `path.sim_id` |
 
 请求体本身的字段问题（负数体积、缺少浓度、未知字段、样本 id 重复、
-`delivered_amount` 非正数或大于 `amount` 等）返回 FastAPI 标准 `422` 结构，
+`delivered_amount` 非正数或大于 `amount`、`execution_mode` 取值不在
+`sequential` / `time_batch` 中等）返回 FastAPI 标准 `422` 结构，
 `detail[].loc` 指明出错字段路径。
 
 ### 查询与列表
@@ -295,8 +389,8 @@ curl "http://localhost:8000/api/simulations?status=failed"
 │   └── database.py    # SQLite 连接与记录持久化
 ├── tests/
 │   ├── conftest.py
-│   ├── test_engine.py # 引擎计算、移液损耗 / 来源 / 守恒与错误定位
-│   └── test_api.py    # API 端到端（17 个用例，含损耗追踪与持久化）
+│   ├── test_engine.py # 引擎计算、移液损耗 / 来源 / 守恒、time_batch 原子批次与错误定位
+│   └── test_api.py    # API 端到端（含损耗追踪、time_batch / OpenAPI 与持久化）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

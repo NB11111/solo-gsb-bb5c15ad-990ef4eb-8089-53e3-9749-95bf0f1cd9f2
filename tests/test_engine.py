@@ -357,3 +357,310 @@ def test_overdraw_still_validated_by_amount():
     assert result["error"]["code"] == "INSUFFICIENT_VOLUME"
     assert result["error"]["location"] == "transfers[0].amount"
     assert result["waste"]["volume"] == 0.0
+
+
+# ---------- execution_mode: time_batch ----------
+
+
+def _run_time_batch(samples, transfers):
+    return run_simulation(
+        SimulationRequest(
+            samples=samples, transfers=transfers, execution_mode="time_batch"
+        )
+    )
+
+
+def test_sequential_mode_batch_index_equals_index():
+    result = run_simulation(make_request())
+    assert [step["batch_index"] for step in result["steps"]] == [0, 1]
+    assert [step["index"] for step in result["steps"]] == [0, 1]
+
+
+def test_time_batch_groups_equal_time_and_assigns_batch_index():
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+            SampleIn(id="B", initial_volume=100.0, concentration=0.0),
+            SampleIn(id="C", initial_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="B", amount=10.0),
+            TransferIn(time=1, source="A", target="C", amount=20.0),
+            TransferIn(time=2, source="B", target="A", amount=5.0),
+        ],
+    )
+    assert result["status"] == "success"
+    assert [step["index"] for step in result["steps"]] == [0, 1, 2]
+    assert [step["batch_index"] for step in result["steps"]] == [0, 0, 1]
+
+    volumes = {t["id"]: t["volume"] for t in result["final_states"]}
+    # 第一批：A 基于批次开始快照被合计吸取 30，B、C 各收 10 / 20；
+    # 第二批：B -> A 5，A 收回 5
+    assert volumes == {"A": 75.0, "B": 105.0, "C": 120.0}
+
+    # 同批各步的 after / conservation 都是整批后的同一视图
+    assert result["steps"][0]["source_after"] == result["steps"][1]["source_after"]
+    assert (
+        result["steps"][0]["conservation"] == result["steps"][1]["conservation"]
+    )
+    batch_conservation = result["steps"][0]["conservation"]
+    assert batch_conservation["volume_before"] == 300.0
+    assert batch_conservation["volume_after"] == 300.0
+    assert batch_conservation["volume_difference"] == 0.0
+
+
+def test_time_batch_order_independent_with_same_tube_send_and_receive():
+    # 同一时刻 A->B 与 B->A：无论数组顺序如何，吸取都基于批次开始快照
+    samples = [
+        SampleIn(id="A", initial_volume=10.0, concentration=10.0),
+        SampleIn(id="B", initial_volume=10.0, concentration=0.0),
+    ]
+    order_one = [
+        TransferIn(time=1, source="A", target="B", amount=6.0),
+        TransferIn(time=1, source="B", target="A", amount=6.0),
+    ]
+    order_two = [
+        TransferIn(time=1, source="B", target="A", amount=6.0),
+        TransferIn(time=1, source="A", target="B", amount=6.0),
+    ]
+
+    result_one = _run_time_batch(samples, order_one)
+    result_two = _run_time_batch(samples, order_two)
+
+    assert result_one["final_states"] == result_two["final_states"]
+    assert result_one["waste"] == result_two["waste"]
+    assert result_one["conservation"] == result_two["conservation"]
+
+    final = {t["id"]: t for t in result_one["final_states"]}
+    # 体积各自一吸一收保持 10；A 质量 100-60=40（收自 B 的为 0），B 质量 60
+    assert final["A"]["volume"] == 10.0
+    assert final["B"]["volume"] == 10.0
+    assert final["A"]["concentrations"]["default"] == 4.0
+    assert final["B"]["concentrations"]["default"] == 6.0
+    # 来源构成：A 剩 A 来源 4 + 收 B 来源 6；B 剩 B 来源 4 + 收 A 来源 6
+    origins_a = {o["source_id"]: o for o in final["A"]["origins"]}
+    assert origins_a["A"]["volume"] == 4.0
+    assert origins_a["B"]["volume"] == 6.0
+    origins_b = {o["source_id"]: o for o in final["B"]["origins"]}
+    assert origins_b["A"]["volume"] == 6.0
+    assert origins_b["B"]["volume"] == 4.0
+
+    # 每步看到的都是整批后的视图：A->B 的 source_after 与 B->A 的
+    # target_after 同为终态 A
+    assert (
+        result_one["steps"][0]["source_after"]
+        == result_one["steps"][1]["target_after"]
+        == final["A"]
+    )
+
+
+def test_time_batch_multi_source_multi_target_and_loss_conservation():
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+            SampleIn(id="B", initial_volume=100.0, markers={"RFP": 8.0}),
+            SampleIn(id="C", initial_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="C", amount=40.0),
+            TransferIn(
+                time=1, source="B", target="C", amount=30.0, delivered_amount=28.0
+            ),
+        ],
+    )
+    assert result["status"] == "success"
+    assert [step["batch_index"] for step in result["steps"]] == [0, 0]
+
+    volumes = {t["id"]: t["volume"] for t in result["final_states"]}
+    # A 出 40；B 吸出 30（只入管 28，损耗 2）；C 收 40+28
+    assert volumes == {"A": 60.0, "B": 70.0, "C": 168.0}
+
+    c = next(t for t in result["final_states"] if t["id"] == "C")
+    assert abs(c["concentrations"]["default"] - 400 / 168) < 1e-9
+    assert abs(c["concentrations"]["RFP"] - 224 / 168) < 1e-9
+
+    # 批次级守恒覆盖多源、多目标与 delivered_amount 损耗
+    for step in result["steps"]:
+        conservation = step["conservation"]
+        assert conservation["volume_before"] == 300.0
+        assert conservation["volume_after"] == 300.0
+        assert conservation["volume_difference"] == 0.0
+        assert conservation["tube_volume_change"] == -2.0
+        assert conservation["marker_amount_difference"]["default"] == 0.0
+        assert conservation["marker_amount_difference"]["RFP"] == 0.0
+        assert conservation["tube_marker_amount_change"]["RFP"] == -16.0
+
+    waste = result["waste"]
+    assert waste["volume"] == 2.0
+    assert waste["marker_amount"]["RFP"] == 16.0
+    total = result["conservation"]
+    assert total["volume_difference"] == 0.0
+    assert total["tube_volume_change"] == -2.0
+    assert total["marker_amount_difference"]["RFP"] == 0.0
+
+
+def test_time_batch_aggregate_overdraw_aborts_whole_batch():
+    # 单条不超量、合计 110 > 批次开始可用量 100：整批不落地
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+            SampleIn(id="B", initial_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="B", amount=60.0),
+            TransferIn(time=1, source="A", target="B", amount=50.0),
+        ],
+    )
+    assert result["status"] == "failed"
+    error = result["error"]
+    assert error["code"] == "INSUFFICIENT_VOLUME"
+    assert error["transfer_index"] == 1
+    assert error["location"] == "transfers[1].amount"
+    # 原子性：整批没有任何一步落地，状态停留在批次开始（初始）
+    assert result["steps"] == []
+    assert {t["id"]: t["volume"] for t in result["final_states"]} == {
+        "A": 100.0,
+        "B": 100.0,
+    }
+    assert result["waste"]["volume"] == 0.0
+
+
+def test_time_batch_failed_batch_keeps_previous_batches():
+    # 第一批成功；第二批对 A 合计吸取 60，但第一批后 A 只剩 50
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+            SampleIn(id="B", initial_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=1, source="A", target="B", amount=50.0),
+            TransferIn(time=2, source="A", target="B", amount=30.0),
+            TransferIn(time=2, source="A", target="B", amount=30.0),
+        ],
+    )
+    assert result["status"] == "failed"
+    assert result["error"]["transfer_index"] == 2
+    assert result["error"]["location"] == "transfers[2].amount"
+
+    # 之前批次（batch 0）结果保留，第二批完全不落地
+    assert len(result["steps"]) == 1
+    assert result["steps"][0]["batch_index"] == 0
+    assert {t["id"]: t["volume"] for t in result["final_states"]} == {
+        "A": 50.0,
+        "B": 150.0,
+    }
+
+
+def test_time_batch_losses_from_batch_start_snapshot():
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=100.0, concentration=10.0),
+            SampleIn(id="B", initial_volume=100.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(
+                time=1, source="A", target="B", amount=50.0, delivered_amount=48.0
+            ),
+            TransferIn(
+                time=1, source="A", target="B", amount=10.0, delivered_amount=9.0
+            ),
+        ],
+    )
+    assert result["status"] == "success"
+
+    assert result["steps"][0]["lost"]["volume"] == 2.0
+    assert result["steps"][1]["lost"]["volume"] == 1.0
+    # 吸出浓度都基于批次开始快照（10.0），与操作顺序无关
+    assert result["steps"][0]["transferred"]["concentrations"]["default"] == 10.0
+    assert result["steps"][1]["transferred"]["concentrations"]["default"] == 10.0
+
+    volumes = {t["id"]: t["volume"] for t in result["final_states"]}
+    assert volumes == {"A": 40.0, "B": 157.0}
+    assert result["waste"]["volume"] == 3.0
+    assert result["waste"]["marker_amount"]["default"] == 30.0
+
+    for step in result["steps"]:
+        conservation = step["conservation"]
+        assert conservation["volume_difference"] == 0.0
+        assert conservation["tube_volume_change"] == -3.0
+        assert conservation["tube_marker_amount_change"]["default"] == -30.0
+
+
+def test_time_batch_iso_times_grouped():
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=10.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=10.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(
+                time="2026-09-18T10:00:00Z", source="A", target="B", amount=1.0
+            ),
+            TransferIn(
+                time="2026-09-18T10:00:00Z", source="A", target="B", amount=1.0
+            ),
+            TransferIn(
+                time="2026-09-18T11:00:00Z", source="A", target="B", amount=1.0
+            ),
+        ],
+    )
+    assert result["status"] == "success"
+    assert [step["batch_index"] for step in result["steps"]] == [0, 0, 1]
+
+
+def test_time_batch_time_reversal_reports_original_index():
+    result = _run_time_batch(
+        samples=[
+            SampleIn(id="A", initial_volume=10.0, concentration=1.0),
+            SampleIn(id="B", initial_volume=10.0, concentration=0.0),
+        ],
+        transfers=[
+            TransferIn(time=2, source="A", target="B", amount=1.0),
+            TransferIn(time=2, source="B", target="A", amount=1.0),
+            TransferIn(time=1, source="A", target="B", amount=1.0),
+        ],
+    )
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "TIME_NOT_ORDERED"
+    assert result["error"]["transfer_index"] == 2
+    assert result["error"]["location"] == "transfers[2].time"
+    # 逆序批次之前的第一批（两步）保留
+    assert len(result["steps"]) == 2
+    assert {step["batch_index"] for step in result["steps"]} == {0}
+
+
+def test_time_batch_unknown_sample_aborts_whole_batch():
+    # 结构性错误同样整批不落地；先批后错，之前批次保留
+    result = _run_time_batch(
+        samples=[SampleIn(id="A", initial_volume=10.0, concentration=1.0)],
+        transfers=[
+            TransferIn(time=1, source="A", target="X", amount=1.0),
+            TransferIn(time=1, source="A", target="X", amount=1.0),
+        ],
+    )
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "UNKNOWN_SAMPLE"
+    assert result["error"]["transfer_index"] == 0
+    assert result["error"]["location"] == "transfers[0].target"
+    assert result["steps"] == []
+    assert result["final_states"][0]["volume"] == 10.0
+
+
+def test_structure_error_precedence_over_time_matches_sequential():
+    # 同时存在“未知管”和“时间逆序”时，两种模式都先报结构错误
+    def build(mode):
+        return SimulationRequest(
+            samples=[SampleIn(id="A", initial_volume=10.0, concentration=1.0)],
+            transfers=[
+                TransferIn(time=2, source="A", target="X", amount=1.0),
+                TransferIn(time=1, source="A", target="A", amount=1.0),
+            ],
+            execution_mode=mode,
+        )
+
+    sequential = run_simulation(build("sequential"))
+    time_batch = run_simulation(build("time_batch"))
+    assert sequential["error"]["code"] == "UNKNOWN_SAMPLE"
+    assert sequential["error"]["transfer_index"] == 0
+    assert time_batch["error"]["code"] == "UNKNOWN_SAMPLE"
+    assert time_batch["error"]["transfer_index"] == 0
